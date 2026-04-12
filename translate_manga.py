@@ -23,7 +23,7 @@ import re
 import io
 import argparse
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
 
 # 加载 .env 配置
@@ -78,52 +78,132 @@ def b64_to_file(b64_str, path):
 
 def is_bubble_text(coord, text):
     """判断是否为气泡内对话文字。
-    过滤：无日文内容、极扁横条（时间戳）、极窄短文本（音效字）。
+    过滤：无日文内容、极扁横条（时间戳）、明确的音效字特征。
     """
     x1, y1, x2, y2 = coord
     w, h = x2 - x1, y2 - y1
     if not re.search(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]', text):
         return False
+    # 极扁横条（时间戳/水印）
     if w / max(h, 1) > 4 and h < 80:
         return False
-    if w < 75 and len(text) <= 4:
+    # 极窄且极短：只过滤宽 < 45px 且 ≤ 2 字符的明显音效字
+    # （之前 < 75px + ≤ 4 字符太严，会误伤"むー"这种 2 字符正常对话）
+    if w < 45 and len(text) <= 2:
         return False
     return True
 
 
-def paint_white_patches(clean_img_bytes, bubble_coords, scale=1.15):
-    """对 clean image 的每个气泡区域画一层白色圆角矩形（兜底方案）。
+def sanitize_translated_text(text):
+    """清理译文中会导致中文字体渲染乱码的字符。
 
-    用于浮动文字/复杂背景场景 - LAMA 擦不干净时，直接覆盖为白底，
-    后续渲染中文就不会看到任何日文残留。
+    站酷快乐体等纯中文字体不包含日文长音符 ー、全角波浪线 ～、
+    装饰符号 ♡♪★ 等 —— 这些字符会被渲染成方块/豆腐字。
+    统一替换为 Unicode 兼容的等效符号或删除。
+    另外修复数字间被错用的中文全角句号（38。3 → 38.3）。
+    """
+    if not text:
+        return text
+    replacements = {
+        "ー": "—",    # 日文长音符 → em dash
+        "～": "~",    # 全角波浪线 → ASCII
+        "♡": "♥",    # 空心爱心 → 实心
+        "♪": "",
+        "♬": "",
+        "★": "",
+        "☆": "",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    # 数字间的全角句号/逗号 → ASCII（38。3度 → 38.3度）
+    text = re.sub(r'(\d)[。．](\d)', r'\1.\2', text)
+    text = re.sub(r'(\d)，(\d)', r'\1,\2', text)
+
+    # 去掉尾部所有非字母数字/中文/常用标点的垃圾符号
+    text = re.sub(
+        r'[^\w\u4e00-\u9fff\u3000-\u303f。，！？、：；""''「」『』（）—…·.,!?:;()\-~\s♥]+$',
+        '', text
+    )
+    return text
+
+
+def paint_white_patches(clean_img_bytes, bubble_coords, bubble_polygons=None, shrink=4):
+    """在每个气泡内画白底（兜底方案，确保后续渲染时无残留）。
+
+    优先使用 polygon（CTD 检测的实际气泡轮廓）填充，能贴合椭圆/不规则气泡形状。
+    没有 polygon 的回退用 bbox 圆角矩形 + 内缩，避免遮挡气泡边线。
 
     Args:
-        clean_img_bytes: PNG bytes of the clean (already inpainted) image
-        bubble_coords: list of [x1,y1,x2,y2] for bubbles to patch
-        scale: how much to expand each bubble before painting (1.0 = exact)
-
-    Returns:
-        PNG bytes of the patched image
+        clean_img_bytes: PNG bytes
+        bubble_coords: [[x1,y1,x2,y2], ...]
+        bubble_polygons: [[[x,y], [x,y], ...], ...] 可选
+        shrink: 内缩像素，避免覆盖气泡边线（默认 4）
     """
     img = Image.open(io.BytesIO(clean_img_bytes)).convert("RGB")
     draw = ImageDraw.Draw(img)
     iw, ih = img.size
-    for c in bubble_coords:
+    polygons = bubble_polygons or []
+
+    for i, c in enumerate(bubble_coords):
+        poly = polygons[i] if i < len(polygons) else None
+        if poly and len(poly) >= 3:
+            # 用 polygon 填充
+            try:
+                pts = [(int(p[0]), int(p[1])) for p in poly]
+                draw.polygon(pts, fill=(255, 255, 255))
+                continue
+            except (TypeError, IndexError):
+                pass
+
+        # 回退：bbox 内缩 + 圆角矩形
         x1, y1, x2, y2 = c
-        cx, cy = (x1+x2)/2, (y1+y2)/2
-        hw, hh = (x2-x1)/2 * scale, (y2-y1)/2 * scale
-        px1, py1 = max(0, int(cx-hw)), max(0, int(cy-hh))
-        px2, py2 = min(iw, int(cx+hw)), min(ih, int(cy+hh))
-        # 圆角矩形白底
-        radius = max(10, int(min(px2-px1, py2-py1) * 0.15))
+        px1 = max(0, int(x1) + shrink)
+        py1 = max(0, int(y1) + shrink)
+        px2 = min(iw, int(x2) - shrink)
+        py2 = min(ih, int(y2) - shrink)
+        if px2 <= px1 or py2 <= py1:
+            continue
+        radius = max(8, int(min(px2-px1, py2-py1) * 0.2))
         try:
             draw.rounded_rectangle([px1, py1, px2, py2], radius=radius, fill=(255, 255, 255))
         except AttributeError:
-            # 老版 Pillow 没有 rounded_rectangle
             draw.rectangle([px1, py1, px2, py2], fill=(255, 255, 255))
+
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
+
+
+def sample_bubble_bg_color(img_arr, coord, polygon=None):
+    """采样气泡的背景色（最亮的非文字像素中位色）。
+
+    用于替代硬编码的白底 —— 当气泡在粉色/彩色背景上时能融合进去。
+    对于常见的白色气泡仍然返回接近白色。
+    """
+    x1, y1, x2, y2 = [int(v) for v in coord]
+    h, w = img_arr.shape[:2]
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(w, x2)
+    y2 = min(h, y2)
+    if x2 <= x1 or y2 <= y1:
+        return (255, 255, 255)
+
+    region = img_arr[y1:y2, x1:x2]
+    gray = np.mean(region, axis=2)
+
+    # 取区域里亮度前 30% 的像素作为"背景候选"（排除文字笔画）
+    threshold = np.percentile(gray, 70)
+    bg_mask = gray >= threshold
+    if bg_mask.sum() < 20:
+        # 回退：直接取全体像素中位
+        bg_pixels = region.reshape(-1, 3)
+    else:
+        bg_pixels = region[bg_mask]
+
+    median = np.median(bg_pixels, axis=0).astype(int)
+    return tuple(int(x) for x in median)
 
 
 def expand_narrow_coords(coords, directions, img_w, img_h):
@@ -140,6 +220,265 @@ def expand_narrow_coords(coords, directions, img_w, img_h):
             x2 = min(img_w, x2 + pad)
         expanded.append([x1, y1, x2, y2])
     return expanded
+
+
+# ── Vision 漏检补充 ─────────────────────────────────────────
+
+def bbox_iou(a, b):
+    """计算两个 bbox 的 IoU"""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = (ix2 - ix1) * (iy2 - iy1)
+    area_a = (ax2 - ax1) * (ay2 - ay1)
+    area_b = (bx2 - bx1) * (by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def detect_missed_bubbles_via_vision(img_pil, existing_coords, max_dim=1536):
+    """用 Gemini Vision 查漏补缺，返回 CTD 遗漏的气泡 bbox 列表（原图坐标）。"""
+    from openai import OpenAI
+
+    client = OpenAI(
+        api_key=GEMINI_KEY,
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+    )
+
+    img_w, img_h = img_pil.size
+    scale = min(max_dim / img_w, max_dim / img_h, 1.0)
+    if scale < 1.0:
+        thumb = img_pil.resize((int(img_w * scale), int(img_h * scale)))
+    else:
+        thumb = img_pil
+    tw, th = thumb.size
+
+    buf = io.BytesIO()
+    thumb.save(buf, format="PNG")
+    img_b64 = base64.b64encode(buf.getvalue()).decode()
+
+    existing_desc = ", ".join(
+        f"[{int(c[0]*scale)},{int(c[1]*scale)},{int(c[2]*scale)},{int(c[3]*scale)}]"
+        for c in existing_coords
+    ) or "（无）"
+
+    prompt = (
+        f"这是一张日文漫画，缩略图尺寸 {tw}x{th}。\n"
+        f"已检测到的文字区域 bbox（x1,y1,x2,y2）：{existing_desc}\n\n"
+        f"请**全面扫描整张图**，找出所有**包含日文文字**的区域，包括但不限于：\n"
+        f"- 所有对话气泡（大的、小的、有边框的、无边框的）\n"
+        f"- 角色独白/内心想法（浮动文字）\n"
+        f"- 标题、章节名、页码标签（比如「三女」「长女」这种）\n"
+        f"- 角色介绍段落（人物设定页里的长段描述文字，可能贴在画面底部或旁边）\n"
+        f"- 旁白/说明文字\n"
+        f"- 角色头顶/旁边的小注释\n\n"
+        f"**不要包含**：\n"
+        f"- 纯拟声词（ドキ、ガタ、キャ 等）\n"
+        f"- 非文字的装饰符号\n"
+        f"- 时间戳 AM 0:30\n"
+        f"- 服装上的英文 Logo\n\n"
+        f"**重要**：不要漏掉任何有日文的区域。已检测列表只是参考，新找到的区域只要与已有 bbox 重叠小于 30% 就要报告出来。\n\n"
+        f"输出严格 JSON 数组（坐标必须是整数且在图片范围内）：\n"
+        f"[[x1,y1,x2,y2], ...]\n"
+        f"只输出 JSON，不要加任何说明。"
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+            ]}],
+            temperature=0.1,
+            max_tokens=800,
+            timeout=120
+        )
+        raw = resp.choices[0].message.content.strip()
+        m = re.search(r'\[[\s\S]*\]', raw)
+        if not m:
+            return []
+        result = json.loads(m.group())
+        if not isinstance(result, list):
+            return []
+        # 缩放回原图坐标
+        missed = []
+        for c in result:
+            if isinstance(c, list) and len(c) == 4:
+                missed.append([
+                    max(0, int(c[0] / scale)),
+                    max(0, int(c[1] / scale)),
+                    min(img_w, int(c[2] / scale)),
+                    min(img_h, int(c[3] / scale)),
+                ])
+        return missed
+    except Exception as e:
+        print(f"  ⚠ Vision detection failed: {e}")
+        return []
+
+
+# ── Gemini 视觉翻译（B 方案：直接从气泡截图翻译，绕过 MangaOCR）─────────
+
+def _get_annotation_font(size=40):
+    """找一个能渲染编号的字体"""
+    for fp in [
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/Arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+    ]:
+        if os.path.exists(fp):
+            try:
+                return ImageFont.truetype(fp, size)
+            except Exception:
+                pass
+    try:
+        return ImageFont.truetype("arial.ttf", size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def _make_annotated_page(img_arr, coords, max_dim=1600):
+    """在原图上画红色编号框，返回 (缩放后的 PNG bytes, scale)"""
+    pil = Image.fromarray(img_arr).convert("RGB").copy()
+    draw = ImageDraw.Draw(pil)
+    font_size = max(24, int(min(pil.size) * 0.025))
+    font = _get_annotation_font(font_size)
+
+    for i, c in enumerate(coords):
+        x1, y1, x2, y2 = [int(v) for v in c]
+        num = str(i + 1)
+        # 红色框
+        draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 0), width=3)
+        # 编号标签：放在左上角外侧（如果溢出顶边就放内侧）
+        try:
+            bbox = draw.textbbox((0, 0), num, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        except AttributeError:
+            tw, th = font_size, font_size
+        lx1 = x1 - 4
+        ly1 = y1 - th - 8
+        if ly1 < 2:
+            ly1 = y1 + 2
+        lx2 = lx1 + tw + 8
+        ly2 = ly1 + th + 6
+        draw.rectangle([lx1, ly1, lx2, ly2], fill=(255, 0, 0))
+        draw.text((lx1 + 4, ly1 + 2), num, fill=(255, 255, 255), font=font)
+
+    # 缩小到合理尺寸
+    w, h = pil.size
+    scale = min(max_dim / w, max_dim / h, 1.0)
+    if scale < 1.0:
+        pil = pil.resize((int(w * scale), int(h * scale)))
+    buf = io.BytesIO()
+    pil.save(buf, format="PNG")
+    return buf.getvalue(), scale
+
+
+def _crop_bubble(img_arr, coord, pad_ratio=0.12, min_pad=15):
+    x1, y1, x2, y2 = [int(v) for v in coord]
+    ih, iw = img_arr.shape[:2]
+    pad_x = max(min_pad, int((x2 - x1) * pad_ratio))
+    pad_y = max(min_pad, int((y2 - y1) * pad_ratio))
+    cx1 = max(0, x1 - pad_x)
+    cy1 = max(0, y1 - pad_y)
+    cx2 = min(iw, x2 + pad_x)
+    cy2 = min(ih, y2 + pad_y)
+    return img_arr[cy1:cy2, cx1:cx2]
+
+
+def translate_bubbles_via_vision(img_arr, coords, max_retries=2):
+    """双输入 Vision 翻译：
+    1) 整页带编号标注（提供全局场景上下文）
+    2) 每个气泡的放大 crop（提供文字细节）
+
+    这样 Gemini 既能看清数字/温度/卡牌等场景含义，也能读清笔画细节。
+    """
+    from openai import OpenAI
+
+    client = OpenAI(
+        api_key=GEMINI_KEY,
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+    )
+
+    if not coords:
+        return []
+
+    # 1) 整页标注图
+    page_bytes, _ = _make_annotated_page(img_arr, coords)
+    page_b64 = base64.b64encode(page_bytes).decode()
+
+    # 2) 每个气泡的 crop
+    crops_b64 = []
+    for c in coords:
+        crop = _crop_bubble(img_arr, c)
+        pil = Image.fromarray(crop)
+        buf = io.BytesIO()
+        pil.save(buf, format="PNG")
+        crops_b64.append(base64.b64encode(buf.getvalue()).decode())
+
+    prompt_text = (
+        f"这是一张日文漫画页。\n"
+        f"第一张图是**整页缩略图**，我用红色数字 1 到 {len(coords)} 标注了每个需要翻译的气泡/文字区域。\n"
+        f"后面跟着 {len(coords)} 张**放大的气泡截图**，按编号顺序排列。\n\n"
+        f"请结合**整页场景**和**每张放大图**，为每个编号给出准确的中文翻译。\n\n"
+        f"**特别重要**：\n"
+        f"- 数字、温度、时间、度数要先看整页场景（例如温度计显示、扑克牌点数、倒计时等），\n"
+        f"  再确认字面内容，不要猜。例如气泡里的「37.3度」不能翻成「3度3分」。\n"
+        f"- **数字中的小数点必须用 ASCII 点（.），不要用中文句号（。）**。\n"
+        f"  正确：38.3度 / 错误：38。3度。\n"
+        f"- 拟声词/叹词翻译成中文习惯的（うわあ→呜哇，きゃあ→呀，えっ→咦）。\n"
+        f"- 不要保留日文长音符 ー，不要保留任何日文标点。\n"
+        f"- 不要添加注释、括号说明、原文标注。\n"
+        f"- 实在看不清的气泡返回空字符串 \"\"。\n"
+        f"- 对人物设定/简介类的长段描述，完整翻译为一段连贯的中文，不要分段。\n\n"
+        f"**输出格式**：严格 JSON 对象，键是编号字符串，值是中文翻译：\n"
+        f'{{"1": "中文1", "2": "中文2", ..., "{len(coords)}": "中文{len(coords)}"}}\n'
+        f"必须包含全部 {len(coords)} 个编号。只输出 JSON，不要加任何其他内容。"
+    )
+
+    content = [
+        {"type": "text", "text": prompt_text},
+        {"type": "text", "text": "【整页缩略图（红色数字为气泡编号）】"},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{page_b64}"}},
+    ]
+    for i, b64 in enumerate(crops_b64):
+        content.append({"type": "text", "text": f"【气泡 {i+1} 的放大图】"})
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
+
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": content}],
+                temperature=0.1,
+                max_tokens=3000,
+                timeout=240
+            )
+            raw = resp.choices[0].message.content.strip()
+            # 提取 JSON 对象
+            m = re.search(r'\{[\s\S]*\}', raw)
+            if m:
+                result = json.loads(m.group())
+                if isinstance(result, dict):
+                    # 按编号顺序取回
+                    out = []
+                    for i in range(len(coords)):
+                        v = result.get(str(i + 1), result.get(i + 1, ""))
+                        out.append(str(v) if v is not None else "")
+                    return out
+        except Exception as e:
+            last_error = e
+            print(f"     ⚠ Gemini Vision 翻译尝试 {attempt+1}/{max_retries} 失败: {e}")
+            continue
+
+    print(f"     ✗ Vision 翻译全部失败，回退空字符串。最后错误: {last_error}")
+    return [""] * len(coords)
 
 
 # ── 审查函数 ─────────────────────────────────────────────
@@ -254,27 +593,57 @@ def translate_image(img_path, output_dir):
     mime = {"jpg": "jpeg", "jpeg": "jpeg"}.get(ext, ext)
     img_b64 = f"data:image/{mime};base64," + base64.b64encode(raw).decode()
 
-    # Step 1: 检测
+    # Step 1: CTD 检测
     print("[1/6] Detecting...")
     det = requests.post(f"{API_BASE}/parallel/detect",
         json={"image": img_b64, "detector_type": "ctd"}, timeout=120).json()
     if not det.get("success"):
         print(f"  FAILED: {det.get('error')}"); return
-    all_coords = det["bubble_coords"]
-    all_polygons = det.get("bubble_polygons", [])
-    all_directions = det.get("auto_directions", [])
+    ctd_coords = list(det["bubble_coords"])
+    ctd_polygons = list(det.get("bubble_polygons", []))
+    ctd_directions = list(det.get("auto_directions", []))
     raw_mask = det.get("raw_mask")
+    print(f"  CTD detected: {len(ctd_coords)} regions")
+
+    # Step 2: OCR CTD 的结果（用于过滤 SFX / 非日文）
+    print("[2/6] OCR CTD regions...")
+    if ctd_coords:
+        ocr = requests.post(f"{API_BASE}/parallel/ocr",
+            json={"image": img_b64, "bubble_coords": ctd_coords, "source_language": SOURCE_LANG},
+            timeout=120).json()
+        if not ocr.get("success"):
+            print(f"  FAILED: {ocr.get('error')}"); return
+        ctd_texts = ocr.get("original_texts", [])
+    else:
+        ctd_texts = []
+    while len(ctd_texts) < len(ctd_coords):
+        ctd_texts.append("")
+
+    # Vision 查漏补缺（基于已过滤的 CTD 结果，避免重复报告 SFX）
+    ctd_valid_coords = [ctd_coords[i] for i in range(len(ctd_coords))
+                        if is_bubble_text(ctd_coords[i], ctd_texts[i])]
+    print("  Vision supplementary detection...")
+    missed = detect_missed_bubbles_via_vision(img_pil, ctd_valid_coords)
+
+    # 合并：CTD 原始 + Vision 新加
+    all_coords = list(ctd_coords)
+    all_polygons = list(ctd_polygons)
+    all_directions = list(ctd_directions)
+    all_texts = list(ctd_texts)
+
+    added_count = 0
+    for mc in missed:
+        if any(bbox_iou(mc, c) > 0.25 for c in all_coords):
+            continue
+        all_coords.append(mc)
+        all_polygons.append([])
+        all_directions.append("v")
+        all_texts.append("__vision__")   # 占位符，表示通过 Vision 发现的（不过滤）
+        added_count += 1
+    print(f"  Vision added: {added_count} new regions (total: {len(all_coords)})")
+
     if not all_coords:
         print("  No text found."); return
-
-    # Step 2: OCR
-    print("[2/6] OCR...")
-    ocr = requests.post(f"{API_BASE}/parallel/ocr",
-        json={"image": img_b64, "bubble_coords": all_coords, "source_language": SOURCE_LANG},
-        timeout=120).json()
-    if not ocr.get("success"):
-        print(f"  FAILED: {ocr.get('error')}"); return
-    all_texts = ocr.get("original_texts", [])
 
     # Step 3: 颜色采样 + 过滤
     print("[3/6] Color & filter...")
@@ -283,7 +652,8 @@ def translate_image(img_path, output_dir):
         t = all_texts[i] if i < len(all_texts) else ""
         c = all_coords[i]
         w, h = c[2]-c[0], c[3]-c[1]
-        if not is_bubble_text(c, t):
+        # Vision 补检的区域绕过过滤（既然 Vision 看到了就信它）
+        if t != "__vision__" and not is_bubble_text(c, t):
             print(f"  ✗ [{i}] \"{t}\"  ({w}x{h}, filtered)")
             continue
         hx, rgb = extract_text_color(img_arr, *c)
@@ -306,205 +676,126 @@ def translate_image(img_path, output_dir):
             nw = render_coords[i][2] - render_coords[i][0]
             print(f"  ↔ Expanded [{i}] width {ow} → {nw}")
 
-    # Step 4: 翻译
-    def do_translate(model_name):
-        return requests.post(f"{API_BASE}/parallel/translate",
-            json={
-                "original_texts": texts, "target_language": TARGET_LANG,
-                "source_language": SOURCE_LANG, "model_provider": "gemini",
-                "model_name": model_name, "api_key": GEMINI_KEY, "rpm_limit": 60
-            }, timeout=180).json()
-
-    def has_jp_kana(s):
-        return bool(re.search(r'[\u3040-\u309F\u30A0-\u30FF]', s))
-
-    print(f"[4/6] Translating ({MODEL})...")
-    tr = do_translate(MODEL)
-    if not tr.get("success"):
-        print(f"  FAILED: {tr.get('error')}"); return
-    translated = tr.get("translated_texts", [])
-
-    # 检测翻译失败的条目（译文仍大量含日文假名）并单独重译
-    for i, t in enumerate(translated):
-        if has_jp_kana(t):
-            print(f"  ⚠ [{i+1}] 翻译失败仍含假名: {t}")
-            # 单条重译
-            retry = requests.post(f"{API_BASE}/translate_single_text",
-                json={
-                    "original_text": texts[i],
-                    "target_language": TARGET_LANG,
-                    "api_key": GEMINI_KEY,
-                    "model_name": MODEL,
-                    "model_provider": "gemini",
-                    "prompt_content": (
-                        "你是漫画翻译。把以下日文翻译成自然的中文。"
-                        "如果是拟声词/尖叫声（うわああ、きゃあ等），翻译为对应的中文拟声（呜哇啊啊、啊——等）。"
-                        "只输出翻译结果，不要加任何说明。"
-                    )
-                }, timeout=60).json()
-            new_t = retry.get("translated_text", "")
-            if new_t and not has_jp_kana(new_t):
-                translated[i] = new_t
-                print(f"     ↻ 重译成功: {new_t}")
-
+    # Step 4: Gemini Vision 翻译（直接从气泡截图翻译，绕过 MangaOCR）
+    print(f"[4/6] Vision translate via {MODEL}...")
+    translated = translate_bubbles_via_vision(img_arr, coords)
+    translated = [sanitize_translated_text(t) for t in translated]
     for i, (o, t) in enumerate(zip(texts, translated)):
-        print(f"  [{i+1}] {o} => {t}")
+        print(f"  [{i+1}] OCR={o[:40]}")
+        print(f"       Vision={t}")
 
-    # Step 5-7: 修复 → 渲染 → 审查（不合格自动重试，逐轮加大修复力度）
-    # 精确掩膜在 JPEG 图上不可靠（笔画边缘漏检），默认就用整框擦除
-    # 重试策略：
-    #   轮1: 整框擦除 + dilate=10 + lama_mpe
-    #   轮2: 整框扩展1.3倍 + dilate=25 + lama_mpe
-    #   轮3: 整框扩展1.6倍 + dilate=50 + litelama  — 暴力模式
-    RETRY_CONFIGS = [
-        {"dilate": 10, "model": "lama_mpe",  "use_raw_mask": False, "box_scale": 1.0, "label": "默认整框擦除"},
-        {"dilate": 25, "model": "lama_mpe",  "use_raw_mask": False, "box_scale": 1.3, "label": "框扩1.3x+加大擦除"},
-        {"dilate": 50, "model": "litelama",  "use_raw_mask": False, "box_scale": 1.6, "label": "框扩1.6x+换模型+最大擦除"},
-    ]
-    MAX_ATTEMPTS = len(RETRY_CONFIGS)
+    # Step 5: 自适应背景色擦除（采样每个气泡的实际背景色，不再硬填白）
+    print("[5/6] Adaptive-bg cleaning...")
+    inpaint_coords = expand_narrow_coords(coords, directions, img_w, img_h)
+    valid_mask = [bool(t and t.strip()) for t in translated]
+
+    # 为每个气泡采样背景色（在原图的原始 coord 范围内取样更准）
+    bg_colors = []
+    for i in range(len(coords)):
+        bg = sample_bubble_bg_color(img_arr, coords[i], polygons[i] if i < len(polygons) else None)
+        bg_colors.append(bg)
+
+    clean_pil = Image.fromarray(img_arr).copy()
+    draw = ImageDraw.Draw(clean_pil)
+    for i, c in enumerate(inpaint_coords):
+        if not valid_mask[i]:
+            continue
+        fill_color = bg_colors[i]
+        poly = polygons[i] if i < len(polygons) else None
+        if poly and len(poly) >= 3:
+            try:
+                pts = [(int(p[0]), int(p[1])) for p in poly]
+                draw.polygon(pts, fill=fill_color)
+                continue
+            except (TypeError, IndexError):
+                pass
+        # bbox 回退：圆角矩形 + 内缩 2px 避开气泡边线
+        x1, y1, x2, y2 = c
+        px1, py1 = max(0, int(x1)+2), max(0, int(y1)+2)
+        px2, py2 = min(img_w, int(x2)-2), min(img_h, int(y2)-2)
+        if px2 > px1 and py2 > py1:
+            radius = max(6, int(min(px2-px1, py2-py1) * 0.18))
+            try:
+                draw.rounded_rectangle([px1, py1, px2, py2], radius=radius, fill=fill_color)
+            except AttributeError:
+                draw.rectangle([px1, py1, px2, py2], fill=fill_color)
+
+    buf = io.BytesIO()
+    clean_pil.save(buf, format="PNG")
+    clean_b64 = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+    # Step 6: 渲染（先过滤空译文 —— Vision 补检可能产生空结果）
+    print("[6/6] Rendering...")
+    # 过滤掉空译文的气泡：这些可能是 Vision 误检或看不清的区域，
+    # 跳过它们能避免白底擦除原图内容
+    valid_indices = [i for i in range(len(coords))
+                     if translated[i] and translated[i].strip()]
+    skipped = len(coords) - len(valid_indices)
+    if skipped > 0:
+        print(f"  跳过 {skipped} 个空译文气泡")
+
+    bubble_states = []
+    final_coords = []
+    final_polygons = []
+    for i in valid_indices:
+        # 文字方向：短文本一律横排，长文本按气泡形状决定
+        rx1, ry1, rx2, ry2 = render_coords[i]
+        bw, bh = rx2 - rx1, ry2 - ry1
+        tt = translated[i]
+        tlen = len(tt)
+        # 含数字（特别是小数）一律横排，否则竖排时小数点会显得很奇怪
+        has_number = bool(re.search(r'\d', tt))
+        if tlen <= 5 or has_number:
+            td = "horizontal"
+        elif bw > bh * 1.1:
+            td = "horizontal"
+        else:
+            td = "vertical"
+        final_coords.append(render_coords[i])
+        final_polygons.append(polygons[i])
+        bg_hex = "#{:02x}{:02x}{:02x}".format(*bg_colors[i])
+        bubble_states.append({
+            "originalText": texts[i],
+            "translatedText": translated[i] if i < len(translated) else "",
+            "textboxText": "",
+            "coords": render_coords[i],
+            "polygon": polygons[i],
+            "fontSize": 28,
+            "fontFamily": FONT,
+            "textDirection": td,
+            "autoTextDirection": td,
+            "textColor": text_colors[i],
+            "fillColor": bg_hex,
+            "rotationAngle": 0,
+            "position": {"x": 0, "y": 0},
+            "strokeEnabled": False,
+            "strokeColor": "#FFFFFF",
+            "strokeWidth": 0,
+            "inpaintMethod": "solid",
+            "autoFgColor": list(fg_rgbs[i]) if fg_rgbs[i] else None,
+            "autoBgColor": None
+        })
+
+    render = requests.post(f"{API_BASE}/parallel/render",
+        json={
+            "clean_image": clean_b64,
+            "bubble_states": bubble_states,
+            "fontSize": 28,
+            "fontFamily": FONT,
+            "textDirection": "vertical",
+            "textColor": "#000000",
+            "strokeEnabled": False,
+            "strokeColor": "#FFFFFF",
+            "strokeWidth": 0,
+            "autoFontSize": True,
+            "use_individual_styles": True
+        }, timeout=120).json()
+    if not render.get("success"):
+        print(f"  FAILED: {render.get('error')}"); return
 
     out_path = os.path.join(output_dir, os.path.splitext(name)[0] + "_translated.png")
-
-    for attempt, cfg in enumerate(RETRY_CONFIGS):
-        attempt_label = f"[尝试 {attempt+1}/{MAX_ATTEMPTS}: {cfg['label']}]"
-
-        # Inpaint — 用扩展坐标擦除，确保窄框文字不残留
-        inpaint_coords = expand_narrow_coords(coords, directions, img_w, img_h)
-        # 根据重试级别对所有 inpaint 坐标做整体放大
-        scale = cfg.get("box_scale", 1.0)
-        if scale > 1.0:
-            scaled = []
-            for c in inpaint_coords:
-                x1, y1, x2, y2 = c
-                cx, cy = (x1+x2)/2, (y1+y2)/2
-                hw, hh = (x2-x1)/2 * scale, (y2-y1)/2 * scale
-                scaled.append([
-                    max(0, int(cx-hw)), max(0, int(cy-hh)),
-                    min(img_w, int(cx+hw)), min(img_h, int(cy+hh))
-                ])
-            inpaint_coords = scaled
-
-        print(f"[5/7] Inpainting {attempt_label}...")
-        inp_data = {
-            "image": img_b64, "bubble_coords": inpaint_coords, "bubble_polygons": polygons,
-            "method": "lama", "lama_model": cfg["model"],
-            "mask_dilate_size": cfg["dilate"]
-        }
-        # 只有第一轮用精确掩膜；重试时去掉，改用整框擦除更彻底
-        if cfg["use_raw_mask"] and raw_mask:
-            inp_data["raw_mask"] = raw_mask
-        inp = requests.post(f"{API_BASE}/parallel/inpaint", json=inp_data, timeout=180).json()
-        if not inp.get("success"):
-            print(f"  FAILED: {inp.get('error')}"); return
-
-        # Render
-        print(f"[6/7] Rendering {attempt_label}...")
-        bubble_states = []
-        for i in range(len(coords)):
-            td = "vertical" if directions[i] == "v" else "horizontal"
-            bubble_states.append({
-                "originalText": texts[i],
-                "translatedText": translated[i] if i < len(translated) else "",
-                "textboxText": "",
-                "coords": render_coords[i],
-                "polygon": polygons[i],
-                "fontSize": 28,
-                "fontFamily": FONT,
-                "textDirection": td,
-                "autoTextDirection": td,
-                "textColor": text_colors[i],
-                "fillColor": "#FFFFFF",
-                "rotationAngle": 0,
-                "position": {"x": 0, "y": 0},
-                "strokeEnabled": False,
-                "strokeColor": "#FFFFFF",
-                "strokeWidth": 0,
-                "inpaintMethod": "lama",
-                "autoFgColor": list(fg_rgbs[i]) if fg_rgbs[i] else None,
-                "autoBgColor": None
-            })
-
-        render = requests.post(f"{API_BASE}/parallel/render",
-            json={
-                "clean_image": inp["clean_image"],
-                "bubble_states": bubble_states,
-                "fontSize": 28,
-                "fontFamily": FONT,
-                "textDirection": "vertical",
-                "textColor": "#000000",
-                "strokeEnabled": False,
-                "strokeColor": "#FFFFFF",
-                "strokeWidth": 0,
-                "autoFontSize": True,
-                "use_individual_styles": True
-            }, timeout=120).json()
-        if not render.get("success"):
-            print(f"  FAILED: {render.get('error')}"); return
-
-        b64_to_file(render["final_image"], out_path)
-
-        # Review
-        print(f"[7/7] Reviewing {attempt_label}...")
-        try:
-            passed, issues = review_translated_image(img_path, out_path)
-        except Exception as e:
-            print(f"  ⚠ Review error: {e}"); passed = True; issues = []
-
-        if passed:
-            print(f"  ✓ PASSED (attempt {attempt+1})")
-            break
-        else:
-            print(f"  ✗ ISSUES:")
-            for issue in issues:
-                print(f"    - {issue}")
-            if attempt < MAX_ATTEMPTS - 1:
-                next_cfg = RETRY_CONFIGS[attempt + 1]
-                print(f"  → 自动重试: {next_cfg['label']} (dilate={next_cfg['dilate']}, model={next_cfg['model']})")
-            else:
-                # 兜底：在最激进的 clean image 上画白底覆盖问题气泡，再渲染一次
-                print(f"  → 兜底方案: 对所有气泡加白底覆盖后重新渲染...")
-                inpaint_coords_final = expand_narrow_coords(coords, directions, img_w, img_h)
-                clean_bytes = base64.b64decode(inp["clean_image"].split(",", 1)[-1])
-                patched_bytes = paint_white_patches(clean_bytes, inpaint_coords_final, scale=1.15)
-                patched_b64 = "data:image/png;base64," + base64.b64encode(patched_bytes).decode()
-
-                final_render = requests.post(f"{API_BASE}/parallel/render",
-                    json={
-                        "clean_image": patched_b64,
-                        "bubble_states": bubble_states,
-                        "fontSize": 28,
-                        "fontFamily": FONT,
-                        "textDirection": "vertical",
-                        "textColor": "#000000",
-                        "strokeEnabled": False,
-                        "strokeColor": "#FFFFFF",
-                        "strokeWidth": 0,
-                        "autoFontSize": True,
-                        "use_individual_styles": True
-                    }, timeout=120).json()
-                if final_render.get("success"):
-                    b64_to_file(final_render["final_image"], out_path)
-                    # 再审查一次
-                    try:
-                        passed2, issues2 = review_translated_image(img_path, out_path)
-                    except Exception:
-                        passed2 = True
-                    if passed2:
-                        print(f"  ✓ PASSED (兜底白底覆盖)")
-                        break
-                    else:
-                        fail_path = out_path.replace("_translated.png", "_translated_REVIEW.png")
-                        os.rename(out_path, fail_path)
-                        print(f"  ✗ 兜底后仍不合格，标记人工复查")
-                        for i in issues2:
-                            print(f"    - {i}")
-                else:
-                    fail_path = out_path.replace("_translated.png", "_translated_REVIEW.png")
-                    os.rename(out_path, fail_path)
-                    print(f"  ✗ 兜底渲染失败")
-
-    final_file = out_path if os.path.exists(out_path) else out_path.replace("_translated.png", "_translated_REVIEW.png")
-    print(f"  Saved: {final_file}")
+    b64_to_file(render["final_image"], out_path)
+    print(f"  Saved: {out_path}")
 
 
 def main():
@@ -534,11 +825,33 @@ def main():
     print(f"Model: {MODEL}")
     print(f"Font: {FONT}")
 
-    for fname in images:
-        translate_image(os.path.join(input_dir, fname), output_dir)
+    # 断点续跑：跳过已有的输出
+    done_count = 0
+    failed = []
+    for idx, fname in enumerate(images, 1):
+        stem = os.path.splitext(fname)[0]
+        out_ok = os.path.join(output_dir, stem + "_translated.png")
+        out_review = os.path.join(output_dir, stem + "_translated_REVIEW.png")
+        if os.path.exists(out_ok) or os.path.exists(out_review):
+            print(f"\n[{idx}/{len(images)}] SKIP {fname} (已存在)")
+            done_count += 1
+            continue
+
+        print(f"\n[{idx}/{len(images)}] {fname}")
+        try:
+            translate_image(os.path.join(input_dir, fname), output_dir)
+            done_count += 1
+        except Exception as e:
+            print(f"  ✗ EXCEPTION: {type(e).__name__}: {e}")
+            failed.append(fname)
+            continue
 
     print(f"\n{'='*60}")
-    print("All done!")
+    print(f"All done! {done_count}/{len(images)} processed")
+    if failed:
+        print(f"Failed ({len(failed)}):")
+        for f in failed:
+            print(f"  - {f}")
 
 
 if __name__ == "__main__":
