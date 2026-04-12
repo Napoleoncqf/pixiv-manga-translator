@@ -1,0 +1,48 @@
+# Saber-Translator Dependencies (CPU Version)
+# pip install -r requirements-cpu.txt
+
+# Flask
+flask
+flask-cors
+
+# Base tools
+pyyaml
+pillow
+opencv-python
+requests
+networkx
+shapely
+pyclipper
+pandas
+freetype-py
+
+# AI/OCR
+openai
+manga-ocr
+rapidocr-onnxruntime
+sentencepiece  # for PaddleOCR-VL
+transformers==4.55.0  # PaddleOCR-VL compatibility
+
+# Deep Learning (CPU)
+torch
+torchvision
+einops
+ultralytics
+seaborn
+litelama
+
+# Other
+dill
+mobi>=0.4.0
+PyMuPDF>=1.23.0
+
+# Manga Insight
+chromadb>=0.4.0
+edge-tts>=6.1.0
+httpx[http2]>=0.25.0
+
+# Web Import
+gallery-dl>=1.26.0
+
+# Build
+pyinstaller

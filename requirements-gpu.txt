@@ -1,0 +1,57 @@
+# ============================================
+# Saber-Translator Dependencies (GPU Version - CUDA 13.0)
+# ============================================
+# Installation:
+# 1. Install non-PyTorch dependencies first:
+#    pip install -r requirements-gpu.txt
+# 
+# 2. Then install GPU version of PyTorch separately:
+#    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+# ============================================
+
+# Flask related
+flask
+flask-cors
+
+# Base tools
+pyyaml
+pillow
+opencv-python
+requests
+networkx
+shapely
+pyclipper
+pandas
+freetype-py
+
+# AI/OCR
+openai
+manga-ocr
+rapidocr-onnxruntime
+sentencepiece  # for PaddleOCR-VL
+transformers==4.55.0  # PaddleOCR-VL compatibility
+accelerate  # required for GPU device_map in transformers
+
+# Deep Learning (torch/torchvision not included, install GPU version separately)
+# torch        # Please use the command above to install GPU version
+# torchvision  # Please use the command above to install GPU version
+einops
+ultralytics
+seaborn
+litelama
+
+# Other
+dill
+mobi>=0.4.0
+PyMuPDF>=1.23.0
+
+# Manga Insight
+chromadb>=0.4.0
+edge-tts>=6.1.0
+httpx[http2]>=0.25.0
+
+# Web Import
+gallery-dl>=1.26.0
+
+# Build
+pyinstaller
