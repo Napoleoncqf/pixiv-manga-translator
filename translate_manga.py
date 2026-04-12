@@ -76,9 +76,22 @@ def b64_to_file(b64_str, path):
         f.write(base64.b64decode(b64_str))
 
 
+# 角色分类标签（不翻译，保留原图）
+ROLE_LABEL_WORDS = {
+    "長女", "次女", "三女", "四女", "五女",
+    "長姉", "次姉", "三姉",
+    "長男", "次男", "三男",
+    "兄", "姉", "妹", "弟",
+    "お姉ちゃん", "お兄ちゃん",
+    # 简体/繁体中文（以防 OCR 识别成汉字）
+    "长女", "次女", "三女", "四女", "五女",
+    "长姐", "次姐", "三姐",
+}
+
+
 def is_bubble_text(coord, text):
     """判断是否为气泡内对话文字。
-    过滤：无日文内容、极扁横条（时间戳）、明确的音效字特征。
+    过滤：无日文内容、极扁横条（时间戳）、明确的音效字特征、角色分类标签词。
     """
     x1, y1, x2, y2 = coord
     w, h = x2 - x1, y2 - y1
@@ -88,8 +101,11 @@ def is_bubble_text(coord, text):
     if w / max(h, 1) > 4 and h < 80:
         return False
     # 极窄且极短：只过滤宽 < 45px 且 ≤ 2 字符的明显音效字
-    # （之前 < 75px + ≤ 4 字符太严，会误伤"むー"这种 2 字符正常对话）
     if w < 45 and len(text) <= 2:
+        return False
+    # 角色分类标签词（OCR 文本完全匹配标签集）
+    cleaned = text.strip().strip("「」『』（）()[]【】").strip()
+    if cleaned in ROLE_LABEL_WORDS:
         return False
     return True
 
@@ -271,7 +287,9 @@ def detect_missed_bubbles_via_vision(img_pil, existing_coords, max_dim=1536):
         f"请**全面扫描整张图**，找出所有**包含日文文字**的区域，包括但不限于：\n"
         f"- 所有对话气泡（大的、小的、有边框的、无边框的）\n"
         f"- 角色独白/内心想法（浮动文字）\n"
-        f"- 标题、章节名、页码标签（比如「三女」「长女」这种）\n"
+        f"- 标题、章节名、页码标签（如「三女」「長女」这种）\n"
+        f"- **粗体艺术字 / 大号装饰性日文**（如「スマホ禁止！」「頑張れ！」「お疲れ！」\n"
+        f"  这种横排或竖排的大字，常常单独占一格画面，必须捕获）\n"
         f"- 角色介绍段落（人物设定页里的长段描述文字，可能贴在画面底部或旁边）\n"
         f"- 旁白/说明文字\n"
         f"- 角色头顶/旁边的小注释\n\n"
@@ -280,7 +298,8 @@ def detect_missed_bubbles_via_vision(img_pil, existing_coords, max_dim=1536):
         f"- 非文字的装饰符号\n"
         f"- 时间戳 AM 0:30\n"
         f"- 服装上的英文 Logo\n\n"
-        f"**重要**：不要漏掉任何有日文的区域。已检测列表只是参考，新找到的区域只要与已有 bbox 重叠小于 30% 就要报告出来。\n\n"
+        f"**重要**：不要漏掉任何有日文的区域。已检测列表只是参考，新找到的区域只要与已有 bbox 重叠小于 30% 就要报告出来。\n"
+        f"**艺术字**很容易被忽略，请特别留意画面上突出的大号粗体字。\n\n"
         f"输出严格 JSON 数组（坐标必须是整数且在图片范围内）：\n"
         f"[[x1,y1,x2,y2], ...]\n"
         f"只输出 JSON，不要加任何说明。"
@@ -427,6 +446,11 @@ def translate_bubbles_via_vision(img_arr, coords, max_retries=2):
         f"后面跟着 {len(coords)} 张**放大的气泡截图**，按编号顺序排列。\n\n"
         f"请结合**整页场景**和**每张放大图**，为每个编号给出准确的中文翻译。\n\n"
         f"**特别重要**：\n"
+        f"- **每个编号对应一个独立的气泡/文字区域**，互不混合。即使两个气泡在画面上靠得很近，\n"
+        f"  也要严格只翻译当前编号方框内的内容，不要把旁边其他编号的文字带进来。\n"
+        f"- **角色分类标签词**（如「長女」「次女」「三女」「お姉ちゃん」等单独出现的标签）\n"
+        f"  对应的编号请只输出该词的中文（如「长女」「次女」「三女」），不要把它附加到\n"
+        f"  其他气泡的翻译里。\n"
         f"- 数字、温度、时间、度数要先看整页场景（例如温度计显示、扑克牌点数、倒计时等），\n"
         f"  再确认字面内容，不要猜。例如气泡里的「37.3度」不能翻成「3度3分」。\n"
         f"- **数字中的小数点必须用 ASCII 点（.），不要用中文句号（。）**。\n"
@@ -631,14 +655,34 @@ def translate_image(img_path, output_dir):
     all_directions = list(ctd_directions)
     all_texts = list(ctd_texts)
 
+    # 先去重
+    new_missed = [mc for mc in missed
+                  if not any(bbox_iou(mc, c) > 0.25 for c in all_coords)]
+    # 给新加的区域跑一次 OCR，方便后续过滤标签词
+    if new_missed:
+        try:
+            ocr2 = requests.post(f"{API_BASE}/parallel/ocr",
+                json={"image": img_b64, "bubble_coords": new_missed, "source_language": SOURCE_LANG},
+                timeout=120).json()
+            new_texts = ocr2.get("original_texts", []) if ocr2.get("success") else []
+        except Exception:
+            new_texts = []
+    else:
+        new_texts = []
+    while len(new_texts) < len(new_missed):
+        new_texts.append("__vision__")
+
     added_count = 0
-    for mc in missed:
-        if any(bbox_iou(mc, c) > 0.25 for c in all_coords):
+    for mc, mt in zip(new_missed, new_texts):
+        # 标签词在过滤阶段会被丢掉；非标签的统一给 __vision__ 占位（保证不被 SFX 过滤）
+        cleaned = mt.strip().strip("「」『』（）()[]【】").strip()
+        if cleaned in ROLE_LABEL_WORDS:
+            print(f"  ⊘ Vision 区域是标签词，跳过: {mt}")
             continue
         all_coords.append(mc)
         all_polygons.append([])
         all_directions.append("v")
-        all_texts.append("__vision__")   # 占位符，表示通过 Vision 发现的（不过滤）
+        all_texts.append("__vision__")
         added_count += 1
     print(f"  Vision added: {added_count} new regions (total: {len(all_coords)})")
 
@@ -668,25 +712,45 @@ def translate_image(img_path, output_dir):
     if not coords:
         print("  No bubble text to translate."); return
 
-    # 扩展窄框
-    render_coords = expand_narrow_coords(coords, directions, img_w, img_h)
-    for i in range(len(coords)):
-        if coords[i] != render_coords[i]:
-            ow = coords[i][2] - coords[i][0]
-            nw = render_coords[i][2] - render_coords[i][0]
-            print(f"  ↔ Expanded [{i}] width {ow} → {nw}")
+    # 渲染坐标 = 原始 coord（不扩展）
+    # 之前用 expand_narrow_coords 会挤出气泡边界挡到画面。
+    # 对横扁的标题/艺术字（宽 > 高 × 1.3），扩大高度让字号能撑起来。
+    render_coords = []
+    for i, c in enumerate(coords):
+        x1, y1, x2, y2 = c
+        bw, bh = x2 - x1, y2 - y1
+        if bw > bh * 1.3 and bh < 150:
+            # 横扁标题：高度扩展到原来的 2 倍（向两侧均匀），让 auto font size 给更大字号
+            extra = int(bh * 1.0)
+            y1 = max(0, y1 - extra // 2)
+            y2 = min(img_h, y2 + extra // 2)
+        render_coords.append([x1, y1, x2, y2])
 
     # Step 4: Gemini Vision 翻译（直接从气泡截图翻译，绕过 MangaOCR）
     print(f"[4/6] Vision translate via {MODEL}...")
     translated = translate_bubbles_via_vision(img_arr, coords)
     translated = [sanitize_translated_text(t) for t in translated]
+
+    # 角色分类标签词不翻译也不擦除（保留原图），漫画读者能直接看懂
+    SKIP_LABEL_WORDS = {
+        "长女", "次女", "三女", "四女", "五女",
+        "长姐", "次姐", "三姐", "二姐", "大姐",
+        "大女儿", "二女儿", "三女儿",
+        "長女", "長姉", "次姉",  # 日文汉字
+    }
+    for i, t in enumerate(translated):
+        cleaned = t.strip().strip("「」『』（）()[]【】")
+        if cleaned in SKIP_LABEL_WORDS:
+            print(f"  ⊘ [{i+1}] 跳过角色标签: {t}")
+            translated[i] = ""  # 清空 → 后续自动跳过擦除+渲染
     for i, (o, t) in enumerate(zip(texts, translated)):
         print(f"  [{i+1}] OCR={o[:40]}")
         print(f"       Vision={t}")
 
-    # Step 5: 自适应背景色擦除（采样每个气泡的实际背景色，不再硬填白）
+    # Step 5: 自适应背景色擦除（采样每个气泡的实际背景色）
+    # 注意：用原始紧凑 coord 而不是扩展 coord，避免擦除/渲染超出气泡遮挡人物
     print("[5/6] Adaptive-bg cleaning...")
-    inpaint_coords = expand_narrow_coords(coords, directions, img_w, img_h)
+    inpaint_coords = list(coords)  # 不做扩展
     valid_mask = [bool(t and t.strip()) for t in translated]
 
     # 为每个气泡采样背景色（在原图的原始 coord 范围内取样更准）
@@ -741,16 +805,26 @@ def translate_image(img_path, output_dir):
         # 文字方向：短文本一律横排，长文本按气泡形状决定
         rx1, ry1, rx2, ry2 = render_coords[i]
         bw, bh = rx2 - rx1, ry2 - ry1
+        # 原始（未扩展）框尺寸 —— 用于判断是否是横扁标题
+        ox1, oy1, ox2, oy2 = coords[i]
+        obw, obh = ox2 - ox1, oy2 - oy1
+        is_title = obw > obh * 1.3 and obh < 150
         tt = translated[i]
         tlen = len(tt)
-        # 含数字（特别是小数）一律横排，否则竖排时小数点会显得很奇怪
+        # 漫画中文约定：默认竖排。只有明确应该横排的情况才横排。
         has_number = bool(re.search(r'\d', tt))
-        if tlen <= 5 or has_number:
+        if has_number:
             td = "horizontal"
-        elif bw > bh * 1.1:
+        elif tlen == 1:
+            td = "horizontal"
+        elif is_title:
+            td = "horizontal"  # 横扁标题强制横排
+        elif bw > bh * 1.5:
             td = "horizontal"
         else:
             td = "vertical"
+        # 横扁标题用更大的字号
+        font_size = 48 if is_title else 28
         final_coords.append(render_coords[i])
         final_polygons.append(polygons[i])
         bg_hex = "#{:02x}{:02x}{:02x}".format(*bg_colors[i])
@@ -760,7 +834,7 @@ def translate_image(img_path, output_dir):
             "textboxText": "",
             "coords": render_coords[i],
             "polygon": polygons[i],
-            "fontSize": 28,
+            "fontSize": font_size,
             "fontFamily": FONT,
             "textDirection": td,
             "autoTextDirection": td,
