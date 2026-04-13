@@ -91,7 +91,8 @@ ROLE_LABEL_WORDS = {
 
 def is_bubble_text(coord, text):
     """判断是否为气泡内对话文字。
-    过滤：无日文内容、极扁横条（时间戳）、明确的音效字特征、角色分类标签词。
+    过滤：无日文内容、极扁横条（时间戳）、明确的音效字特征、角色分类标签词、
+    大尺寸艺术字音效（每字平均占用 > 5000 px）。
     """
     x1, y1, x2, y2 = coord
     w, h = x2 - x1, y2 - y1
@@ -103,9 +104,15 @@ def is_bubble_text(coord, text):
     # 极窄且极短：只过滤宽 < 45px 且 ≤ 2 字符的明显音效字
     if w < 45 and len(text) <= 2:
         return False
-    # 角色分类标签词（OCR 文本完全匹配标签集）
+    # 角色分类标签词
     cleaned = text.strip().strip("「」『』（）()[]【】").strip()
     if cleaned in ROLE_LABEL_WORDS:
+        return False
+    # 大尺寸艺术字音效：OCR 文本很短（≤5 字）但 bbox 每字平均面积极大（>5000 px）
+    # 通常是手绘毛笔风格的 SFX，Vision 翻译结果不可靠，强行渲染会大面积遮挡画面
+    char_count = max(len(cleaned), 1)
+    area_per_char = (w * h) / char_count
+    if char_count <= 5 and area_per_char > 5000:
         return False
     return True
 
@@ -255,10 +262,10 @@ def bbox_iou(a, b):
     return inter / union if union > 0 else 0.0
 
 
-def detect_missed_bubbles_via_vision(img_pil, existing_coords, max_dim=2400):
+def detect_missed_bubbles_via_vision(img_pil, existing_coords, max_dim=3500):
     """用 Gemini Vision 查漏补缺，返回 CTD 遗漏的气泡 bbox 列表（原图坐标）。
 
-    使用较高分辨率（2400px）以捕获密集排列的小气泡。
+    使用高分辨率（3500px）以捕获密集小气泡和大号艺术字（スマホ禁止！等）。
     """
     from openai import OpenAI
 
@@ -310,39 +317,71 @@ def detect_missed_bubbles_via_vision(img_pil, existing_coords, max_dim=2400):
         f"只输出 JSON，不要加任何说明。"
     )
 
-    try:
-        resp = client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "user", "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url",
-                 "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
-            ]}],
-            temperature=0.1,
-            max_tokens=800,
-            timeout=120
-        )
-        raw = resp.choices[0].message.content.strip()
-        m = re.search(r'\[[\s\S]*\]', raw)
-        if not m:
+    def run_vision_detect(system_prompt):
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": [
+                    {"type": "text", "text": system_prompt},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+                ]}],
+                temperature=0.1,
+                max_tokens=8000,
+                timeout=180
+            )
+            raw = (resp.choices[0].message.content or "").strip()
+            m = re.search(r'\[[\s\S]*\]', raw)
+            if not m:
+                return []
+            result = json.loads(m.group())
+            if not isinstance(result, list):
+                return []
+            out = []
+            for c in result:
+                if isinstance(c, list) and len(c) == 4:
+                    out.append([
+                        max(0, int(c[0] / scale)),
+                        max(0, int(c[1] / scale)),
+                        min(img_w, int(c[2] / scale)),
+                        min(img_h, int(c[3] / scale)),
+                    ])
+            return out
+        except Exception as e:
+            print(f"  ⚠ Vision detection call failed: {e}")
             return []
-        result = json.loads(m.group())
-        if not isinstance(result, list):
-            return []
-        # 缩放回原图坐标
-        missed = []
-        for c in result:
-            if isinstance(c, list) and len(c) == 4:
-                missed.append([
-                    max(0, int(c[0] / scale)),
-                    max(0, int(c[1] / scale)),
-                    min(img_w, int(c[2] / scale)),
-                    min(img_h, int(c[3] / scale)),
-                ])
-        return missed
-    except Exception as e:
-        print(f"  ⚠ Vision detection failed: {e}")
-        return []
+
+    # 主扫描
+    missed = run_vision_detect(prompt)
+
+    # 专检：大号装饰艺术字（CTD 常常漏）
+    art_prompt = (
+        f"这是一张日文漫画，图片尺寸 {tw}x{th}。\n"
+        f"请**只扫描大号装饰性艺术字 / 粗体标题 / 风格化书法字**，比如：\n"
+        f"- 竖排或横排的大号日文，独占画面一块区域\n"
+        f"- 带有墨水/毛笔风格的粗体字\n"
+        f"- 占整个分格 10% 面积以上的装饰文字\n"
+        f"- 典型例子：「スマホ禁止！」「頑張れ！」「お疲れ！」「はやく！」「だめ！」\n"
+        f"- 这些字常常画得很大、很粗、很醒目，但 CTD 检测器容易漏掉\n\n"
+        f"**不要包含**：\n"
+        f"- 普通对话气泡内的文字\n"
+        f"- 小号拟声词（ドキ、ガタ 等）\n"
+        f"- 服装 Logo\n\n"
+        f"返回严格 JSON 数组（坐标必须整数）：\n"
+        f"[[x1,y1,x2,y2], ...]\n"
+        f"没有找到就返回 []。只输出 JSON，不要加任何说明。"
+    )
+    art_regions = run_vision_detect(art_prompt)
+
+    # 合并去重
+    all_missed = []
+    seen = []
+    for c in missed + art_regions:
+        if any(bbox_iou(c, s) > 0.3 for s in seen):
+            continue
+        all_missed.append(c)
+        seen.append(c)
+    return all_missed
 
 
 # ── Gemini 视觉翻译（B 方案：直接从气泡截图翻译，绕过 MangaOCR）─────────
