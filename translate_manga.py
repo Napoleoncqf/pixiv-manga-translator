@@ -486,10 +486,11 @@ def translate_bubbles_via_vision(img_arr, coords, max_retries=2):
                 model=MODEL,
                 messages=[{"role": "user", "content": content}],
                 temperature=0.1,
-                max_tokens=3000,
-                timeout=240
+                max_tokens=12000,  # Pro 3.1 reasoning 模型思考占大量 token，需要留足输出空间
+                timeout=300
             )
-            raw = resp.choices[0].message.content.strip()
+            # content 可能是 None（空响应或全用于 reasoning）
+            raw = (resp.choices[0].message.content or "").strip()
             # 提取 JSON 对象
             m = re.search(r'\{[\s\S]*\}', raw)
             if m:
