@@ -65,6 +65,10 @@ data/
 # --- Pixiv 下载 ---
 pixiv_download/
 
+# --- 审查运行时输出 ---
+audit_result.json
+redo/
+
 # --- Node ---
 node_modules/
 
